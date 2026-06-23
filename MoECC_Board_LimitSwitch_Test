@@ -1,0 +1,476 @@
+/*
+ * ============================================================================
+ * MOECC-BOARD-1  TEST 02  –  WQ SWITCH INPUT TEST  (v1.2)
+ * Board : MOECC-BOARD-1 v1.1.1  |  MCU: ESP32-S3-WROOM-1
+ *
+ * Changes in v1.2:
+ *   MONITOR – prints ONE clean line every 200 ms showing all 4 GPIO states:
+ *             "GPIO4:HIGH  GPIO5:HIGH  GPIO6:LOW   GPIO7:HIGH"
+ *             Never resets on re-entry. Type STOP to halt.
+ *
+ *   WAIT    – after trigger detected keeps showing ALL 4 live GPIO levels
+ *             every 200 ms throughout the entire wait window.
+ *             Re-arms immediately for next trigger (counts all of them).
+ *             WAIT runs in its own task so cmd_task stays responsive.
+ *             Type STOP at any time to abort WAIT.
+ *
+ * CMD INTERFACE (UART0, 115200 8N1, J14):
+ *   WAIT <idx>    – watch switch (1-4) or 0=all, live display + trigger count
+ *   MONITOR       – continuous live 4-GPIO line every 200 ms
+ *   STOP          – stop MONITOR or abort WAIT
+ *   STATUS        – print current levels once
+ *   HELP
+ *
+ * INDEX:  1=WQ_1(J18/GPIO4)  2=WQ_2(J20/GPIO5)
+ *         3=WQ_3(J21/GPIO6)  4=WQ_4(J22/GPIO7)
+ *
+ * JST connector: pin1 = signal, pin2 = GND (active-LOW)
+ * ============================================================================
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+
+/* ── Pin map ────────────────────────────────────────────────────────────── */
+#define PIN_WQ1   4
+#define PIN_WQ2   5
+#define PIN_WQ3   6
+#define PIN_WQ4   7
+
+/* ── UART ────────────────────────────────────────────────────────────────── */
+#define CMD_UART_NUM   UART_NUM_0
+#define CMD_UART_BAUD  115200
+#define CMD_RX_BUF     512
+#define CMD_TX_BUF     256
+
+/* ── Timing ──────────────────────────────────────────────────────────────── */
+#define DEBOUNCE_MS       50     /* two-sample debounce window               */
+#define DISPLAY_PERIOD_MS 200    /* live display refresh rate                */
+#define WAIT_TIMEOUT_MS   30000  /* WAIT exits after this ms (0=never)       */
+#define WAIT_HB_MS        5000   /* trigger-count/elapsed heartbeat in WAIT  */
+
+static const char *TAG = "TEST02_WQ_SW";
+
+/* ── Switch table (1-based, [0] unused) ─────────────────────────────────── */
+typedef struct {
+    gpio_num_t  pin;
+    const char *name;
+    const char *connector;
+    uint32_t    trigger_count;
+} sw_t;
+
+static sw_t sw[5] = {
+    { 0,       "---",  "---" , 0 },
+    { PIN_WQ1, "WQ_1", "J18" , 0 },
+    { PIN_WQ2, "WQ_2", "J20" , 0 },
+    { PIN_WQ3, "WQ_3", "J21" , 0 },
+    { PIN_WQ4, "WQ_4", "J22" , 0 },
+};
+#define NUM_SW 4
+
+/* ── Shared state ────────────────────────────────────────────────────────── */
+static volatile bool     g_monitor_active = false;
+static volatile bool     g_wait_active    = false;
+static volatile bool     g_stop_flag      = false;
+static volatile int      g_wait_idx       = 0;
+static TaskHandle_t      g_wait_task_hdl  = NULL;
+
+/* ── GPIO init ───────────────────────────────────────────────────────────── */
+static void init_inputs(void)
+{
+    gpio_config_t cfg = {
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+        .pin_bit_mask = (1ULL << PIN_WQ1) | (1ULL << PIN_WQ2) |
+                        (1ULL << PIN_WQ3) | (1ULL << PIN_WQ4),
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+}
+
+/* ── UART init ───────────────────────────────────────────────────────────── */
+static void init_uart(void)
+{
+    uart_config_t cfg = {
+        .baud_rate  = CMD_UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_param_config(CMD_UART_NUM, &cfg));
+    ESP_ERROR_CHECK(uart_driver_install(CMD_UART_NUM,
+                                        CMD_RX_BUF, CMD_TX_BUF, 0, NULL, 0));
+}
+
+/* ── Read all four GPIO levels into array [1..4] ────────────────────────── */
+static void read_all(int levels[5])
+{
+    for (int i = 1; i <= NUM_SW; i++) {
+        levels[i] = gpio_get_level(sw[i].pin);
+    }
+}
+
+/* ── Format and log one live-display line ───────────────────────────────── */
+/*   Output: "GPIO4:HIGH  GPIO5:HIGH  GPIO6:LOW   GPIO7:HIGH"               */
+static void log_live_line(const int levels[5])
+{
+    ESP_LOGI(TAG, "GPIO4:%-4s  GPIO5:%-4s  GPIO6:%-4s  GPIO7:%-4s",
+             levels[1] ? "HIGH" : "LOW ",
+             levels[2] ? "HIGH" : "LOW ",
+             levels[3] ? "HIGH" : "LOW ",
+             levels[4] ? "HIGH" : "LOW ");
+}
+
+/* ── Print status once (for STATUS cmd) ─────────────────────────────────── */
+static void print_status(void)
+{
+    int lvl[5];
+    read_all(lvl);
+    ESP_LOGI(TAG, "─── WQ SWITCH STATUS ──────────────────────────");
+    for (int i = 1; i <= NUM_SW; i++) {
+        ESP_LOGI(TAG, "  [%d] GPIO%d  %-5s  %-4s  %s  triggers=%lu",
+                 i, sw[i].pin, sw[i].name, sw[i].connector,
+                 lvl[i] == 0 ? "LOW  ● ACTIVE" : "HIGH ○ IDLE  ",
+                 sw[i].trigger_count);
+    }
+    ESP_LOGI(TAG, "───────────────────────────────────────────────");
+}
+
+/* ── Debounced read: returns 0/1 when stable, -1 while bouncing ─────────── */
+static int debounce(gpio_num_t pin)
+{
+    int a = gpio_get_level(pin);
+    vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+    int b = gpio_get_level(pin);
+    return (a == b) ? a : -1;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * MONITOR TASK  –  always running, prints live line when active
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void monitor_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    for (;;) {
+        if (!g_monitor_active) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /* STOP check */
+        if (g_stop_flag && !g_wait_active) {
+            /* Only consume the stop flag if WAIT is not using it */
+            g_monitor_active = false;
+            g_stop_flag      = false;
+            ESP_LOGI(TAG, "[MON] stopped. Type MONITOR to restart.");
+            continue;
+        }
+
+        int levels[5];
+        read_all(levels);
+        log_live_line(levels);
+
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * WAIT TASK  –  spawned on WAIT cmd, self-deletes when done
+ *
+ * Behaviour:
+ *   • Prints live 4-GPIO line every DISPLAY_PERIOD_MS throughout.
+ *   • Watches the target switch(es) for falling edge.
+ *   • On trigger: logs "TRIGGERED" line, increments count, re-arms.
+ *   • Exits on: STOP flag, timeout, or all switches triggered once (if 0=all).
+ * ══════════════════════════════════════════════════════════════════════════ */
+typedef struct {
+    int      idx;          /* 1-4 for single, 0 for "all in order"          */
+    uint32_t timeout_ms;
+} wait_args_t;
+
+static void wait_task(void *pvParameters)
+{
+    wait_args_t *args    = (wait_args_t *)pvParameters;
+    int          idx     = args->idx;
+    uint32_t     timeout = args->timeout_ms;
+    free(args);
+
+    /* Build watch list */
+    int watch[5];
+    int watch_count;
+    if (idx == 0) {
+        for (int i = 1; i <= NUM_SW; i++) watch[i-1] = i;
+        watch_count = NUM_SW;
+    } else {
+        watch[0]    = idx;
+        watch_count = 1;
+    }
+
+    ESP_LOGI(TAG, "╔═══ WAIT started ═══════════════════════════════╗");
+    if (idx == 0) {
+        ESP_LOGI(TAG, "║  Watching: ALL 4 switches                      ║");
+    } else {
+        ESP_LOGI(TAG, "║  Watching: [%d] %s (%s)  GPIO%d              ║",
+                 idx, sw[idx].name, sw[idx].connector, sw[idx].pin);
+    }
+    ESP_LOGI(TAG, "║  Trigger: short JST pin1 → pin2 (GND)          ║");
+    ESP_LOGI(TAG, "║  Type STOP to abort                             ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════╝");
+
+    /* prev state per switch – initialised from current level */
+    int prev[5];
+    for (int i = 0; i < watch_count; i++) {
+        prev[i] = gpio_get_level(sw[watch[i]].pin);
+    }
+
+    uint32_t start_ms   = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    uint32_t last_hb_ms = start_ms;
+    uint32_t last_dp_ms = start_ms;
+
+    while (1) {
+        uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+        /* ── STOP / timeout check ────────────────────────────────────────── */
+        if (g_stop_flag) {
+            g_stop_flag = false;
+            ESP_LOGI(TAG, "[WAIT] aborted by STOP.");
+            break;
+        }
+        if (timeout > 0 && (now_ms - start_ms) >= timeout) {
+            uint32_t total = 0;
+            for (int i = 0; i < watch_count; i++) total += sw[watch[i]].trigger_count;
+            ESP_LOGI(TAG, "[WAIT] timeout. Total triggers: %lu. Type WAIT again to restart.", total);
+            break;
+        }
+
+        /* ── Live display line (every DISPLAY_PERIOD_MS) ─────────────────── */
+        if ((now_ms - last_dp_ms) >= DISPLAY_PERIOD_MS) {
+            int levels[5];
+            read_all(levels);
+            log_live_line(levels);
+            last_dp_ms = now_ms;
+        }
+
+        /* ── Heartbeat (every WAIT_HB_MS) ───────────────────────────────── */
+        if ((now_ms - last_hb_ms) >= WAIT_HB_MS) {
+            uint32_t elapsed = (now_ms - start_ms) / 1000;
+            ESP_LOGI(TAG, "  [WAIT hb] elapsed=%lus  triggers so far:", elapsed);
+            for (int i = 0; i < watch_count; i++) {
+                int wi = watch[i];
+                ESP_LOGI(TAG, "    [%d] %s: %lu", wi, sw[wi].name, sw[wi].trigger_count);
+            }
+            last_hb_ms = now_ms;
+        }
+
+        /* ── Scan each watched switch for falling edge ───────────────────── */
+        for (int i = 0; i < watch_count; i++) {
+            int wi  = watch[i];
+            int cur = debounce(sw[wi].pin);
+
+            if (cur < 0) { continue; }         /* bouncing – skip, don't touch prev */
+
+            if (prev[i] == 1 && cur == 0) {
+                /* ── TRIGGER ─────────────────────────────────────────────── */
+                sw[wi].trigger_count++;
+
+                /* Print trigger line with ALL 4 GPIO states at that moment */
+                int snap[5];
+                read_all(snap);
+                ESP_LOGI(TAG, "★ TRIGGER [%d] %s (%s)  count=%lu",
+                         wi, sw[wi].name, sw[wi].connector, sw[wi].trigger_count);
+                ESP_LOGI(TAG, "  GPIO4:%-4s  GPIO5:%-4s  GPIO6:%-4s  GPIO7:%-4s",
+                         snap[1] ? "HIGH" : "LOW ",
+                         snap[2] ? "HIGH" : "LOW ",
+                         snap[3] ? "HIGH" : "LOW ",
+                         snap[4] ? "HIGH" : "LOW ");
+
+                /* Wait for release while continuing to print live display */
+                ESP_LOGI(TAG, "  (waiting for pin to return HIGH…)");
+                while (gpio_get_level(sw[wi].pin) == 0) {
+                    uint32_t n2 = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                    if ((n2 - last_dp_ms) >= DISPLAY_PERIOD_MS) {
+                        int lv[5]; read_all(lv); log_live_line(lv);
+                        last_dp_ms = n2;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+                vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+                {
+                    int snap2[5]; read_all(snap2);
+                    ESP_LOGI(TAG, "  Released – GPIO4:%-4s  GPIO5:%-4s  GPIO6:%-4s  GPIO7:%-4s",
+                             snap2[1]?"HIGH":"LOW ", snap2[2]?"HIGH":"LOW ",
+                             snap2[3]?"HIGH":"LOW ", snap2[4]?"HIGH":"LOW ");
+                }
+                prev[i] = 1;   /* re-arm */
+            } else {
+                prev[i] = cur;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    /* ── Final summary ───────────────────────────────────────────────────── */
+    ESP_LOGI(TAG, "─── WAIT SUMMARY ───────────────────────────────");
+    for (int i = 0; i < watch_count; i++) {
+        int wi = watch[i];
+        ESP_LOGI(TAG, "  [%d] %s (%s): %lu trigger(s)",
+                 wi, sw[wi].name, sw[wi].connector, sw[wi].trigger_count);
+    }
+    ESP_LOGI(TAG, "────────────────────────────────────────────────");
+
+    g_wait_active   = false;
+    g_wait_task_hdl = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * CMD PROCESSOR
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void process_cmd(const char *line)
+{
+    char cmd[16] = {0}, a1[16] = {0};
+    sscanf(line, "%15s %15s", cmd, a1);
+    for (char *p = cmd; *p; p++) { if (*p >= 'a' && *p <= 'z') *p -= 32; }
+    for (char *p = a1;  *p; p++) { if (*p >= 'a' && *p <= 'z') *p -= 32; }
+
+    /* ── HELP ────────────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "HELP") == 0) {
+        const char *h =
+            "\r\n════ TEST02 WQ SWITCH COMMANDS ══════════════\r\n"
+            "  WAIT <idx>   Watch switch & show live levels\r\n"
+            "               idx: 1=WQ_1  2=WQ_2  3=WQ_3  4=WQ_4\r\n"
+            "               idx: 0 = watch all 4 in order\r\n"
+            "  MONITOR      Continuous GPIO4/5/6/7 display (200ms)\r\n"
+            "  STOP         Stop MONITOR or abort WAIT\r\n"
+            "  STATUS       Print current levels once\r\n"
+            "  HELP         This list\r\n"
+            "\r\n"
+            "  Trigger: short JST pin1 (signal) to pin2 (GND)\r\n"
+            "  Connectors: J18=WQ_1  J20=WQ_2  J21=WQ_3  J22=WQ_4\r\n"
+            "═════════════════════════════════════════════\r\n";
+        uart_write_bytes(CMD_UART_NUM, h, strlen(h));
+        return;
+    }
+
+    /* ── STATUS ──────────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "STATUS") == 0) {
+        print_status();
+        return;
+    }
+
+    /* ── STOP ────────────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "STOP") == 0) {
+        g_stop_flag      = true;
+        g_monitor_active = false;
+        ESP_LOGI(TAG, "STOP sent.");
+        return;
+    }
+
+    /* ── MONITOR ─────────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "MONITOR") == 0) {
+        /* Don't reset anything – just enable. Task keeps last known state. */
+        g_stop_flag      = false;
+        g_monitor_active = true;
+        ESP_LOGI(TAG, "Monitor ON – GPIO4/5/6/7 live every %d ms. Type STOP to halt.",
+                 DISPLAY_PERIOD_MS);
+        return;
+    }
+
+    /* ── WAIT ────────────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "WAIT") == 0) {
+        if (g_wait_active) {
+            ESP_LOGW(TAG, "WAIT already running. Type STOP first.");
+            return;
+        }
+        int idx = atoi(a1);
+        if (idx < 0 || idx > NUM_SW) {
+            ESP_LOGW(TAG, "Bad index '%s'. Valid: 0-4.", a1);
+            return;
+        }
+        wait_args_t *args = malloc(sizeof(wait_args_t));
+        if (!args) { ESP_LOGE(TAG, "malloc failed"); return; }
+        args->idx        = idx;
+        args->timeout_ms = WAIT_TIMEOUT_MS;
+
+        g_stop_flag   = false;
+        g_wait_active = true;
+        BaseType_t r  = xTaskCreate(wait_task, "wait", 4096, args, 5, &g_wait_task_hdl);
+        if (r != pdPASS) {
+            ESP_LOGE(TAG, "xTaskCreate wait_task failed");
+            g_wait_active = false;
+            free(args);
+        }
+        return;
+    }
+
+    ESP_LOGW(TAG, "Unknown cmd '%s'. Type HELP.", cmd);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * CMD TASK  –  always reads UART, always responsive
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void cmd_task(void *pvParameters)
+{
+    (void)pvParameters;
+    char    buf[128];
+    int     len = 0;
+    uint8_t b;
+
+    for (;;) {
+        if (uart_read_bytes(CMD_UART_NUM, &b, 1, pdMS_TO_TICKS(50)) <= 0) {
+            continue;
+        }
+        uart_write_bytes(CMD_UART_NUM, (const char *)&b, 1);
+
+        if (b == '\r' || b == '\n') {
+            if (len > 0) {
+                buf[len] = '\0';
+                uart_write_bytes(CMD_UART_NUM, "\r\n", 2);
+                process_cmd(buf);
+                len = 0;
+            }
+        } else if (b == '\b' || b == 127) {
+            if (len > 0) len--;
+        } else if (len < (int)sizeof(buf) - 1) {
+            buf[len++] = (char)b;
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * APP ENTRY
+ * ══════════════════════════════════════════════════════════════════════════ */
+void app_main(void)
+{
+    init_inputs();
+    init_uart();
+
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "MOECC-BOARD-1  TEST 02: WQ SWITCH INPUT TEST  v1.2");
+    ESP_LOGI(TAG, "Build: %s %s", __DATE__, __TIME__);
+    ESP_LOGI(TAG, "Pull-up: 47 kΩ board + internal.  Active-LOW.");
+    ESP_LOGI(TAG, "  MONITOR  → live GPIO4/5/6/7 line every 200 ms");
+    ESP_LOGI(TAG, "  WAIT <n> → watch for triggers + live display");
+    ESP_LOGI(TAG, "  STOP     → stop either mode");
+    ESP_LOGI(TAG, "  Type HELP for full list");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════");
+    print_status();
+
+    BaseType_t r1 = xTaskCreate(monitor_task, "mon", 2048, NULL, 4, NULL);
+    BaseType_t r2 = xTaskCreate(cmd_task,     "cmd", 4096, NULL, 6, NULL);
+    if (r1 != pdPASS || r2 != pdPASS) {
+        ESP_LOGE(TAG, "FATAL: xTaskCreate failed");
+        for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
+}
